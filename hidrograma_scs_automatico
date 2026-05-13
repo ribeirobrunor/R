@@ -1,0 +1,665 @@
+# ==============================================================================
+# ANÁLISE HIDROLÓGICA COMPLETA — SELEÇÃO AUTOMÁTICA DE ESTAÇÕES (ANA)
+# Ponderação por Polígonos de Thiessen (Voronoi)
+# ==============================================================================
+#
+# FLUXO GERAL:
+#   1. Carrega shapefile da bacia e cria buffer inicial
+#   2. Consulta HidroInventário (ANA) e filtra estações pluviométricas no buffer
+#   3. Se não houver estações, expande o buffer progressivamente até encontrar
+#   4. Calcula pesos de Thiessen (Voronoi) intersectado com o buffer da bacia
+#   5. Baixa séries históricas de cada estação (HidroSerieHistorica)
+#   6. Calcula máxima anual ponderada por Thiessen
+#   7. Ajusta distribuição de Gumbel e calcula chuvas de projeto
+#   8. Constrói hidrogramas SCS para cada TR
+#   9. Plota painel completo (ggplot2 + patchwork)
+#
+# ==============================================================================
+
+# --- BIBLIOTECAS --------------------------------------------------------------
+library(sf)
+library(httr)
+library(xml2)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(scales)
+
+# ==============================================================================
+# SEÇÃO 1 — CONFIGURAÇÕES DO USUÁRIO
+# ==============================================================================
+
+path_shape         <- "C:/Users/bruno.ribeiro/Documents/SSD_PORTATIL/SECID/01.ADESAO/SEROPEDICA/DADOS_GIS/shapefile/bacia_valao_do_china_pourpoint.shp"
+dist_buffer_inicial <- 10000      # Buffer inicial em metros (10 km)
+dist_buffer_max     <- 100000     # Limite máximo de expansão (100 km)
+step_expansao       <- 5000       # Incremento de expansão (5 km)
+tr_alvos            <- c(25, 50, 100)
+nivel_consistencia  <- 2          # 1 = bruto | 2 = consistido
+
+# Parâmetros da bacia (editar conforme levantamento)
+area_km2               <- 0.862
+comprimento_talvegue_m <- 1692.21
+declividade_m_m        <- 0.0004
+CN                     <- 77
+p                      <- 0.4     # Fração de cobertura vegetal (0–1)
+
+# ==============================================================================
+# SEÇÃO 2 — CARREGAMENTO DA BACIA E BUFFER ADAPTATIVO
+# ==============================================================================
+
+bacia <- st_read(path_shape, quiet = TRUE)
+
+# Garante projeção métrica (UTM SIRGAS 2000 zona 23S) para buffer e Voronoi
+if (st_is_longlat(bacia)) {
+  bacia_utm <- st_transform(bacia, 31983)
+} else {
+  bacia_utm <- bacia
+}
+
+# Dissolve para um único polígono caso haja múltiplas feições
+bacia_utm <- st_union(bacia_utm) %>% st_sf()
+
+message("Bacia carregada. Área estimada: ",
+        round(as.numeric(st_area(bacia_utm)) / 1e6, 3), " km²")
+
+# ==============================================================================
+# SEÇÃO 3 — CONSULTA AO HIDROINVENTÁRIO (ANA)
+# ==============================================================================
+
+#' Baixa o inventário completo de estações pluviométricas da ANA.
+#' Endpoint: HidroInventario
+#' @return sf com geometria de pontos (WGS84 → UTM 31983)
+obter_inventario_ana <- function() {
+
+  url <- "http://telemetriaws1.ana.gov.br/ServiceANA.asmx/HidroInventario"
+
+  resp <- GET(url, query = list(
+    codEstDE       = "",
+    codEstATE      = "",
+    tpEst          = "2",   # 2 = Pluviométrica
+    nmEst          = "",
+    nmRio          = "",
+    codSubBacia    = "",
+    codBacia       = "",
+    nmMunicipio    = "",
+    nmEstado       = "",
+    sgResp         = "",
+    sgOper         = "",
+    telemetrica    = ""
+  ), timeout(60))
+
+  if (http_error(resp)) stop("Falha ao acessar HidroInventario da ANA.")
+
+  xml_root  <- read_xml(content(resp, "text", encoding = "UTF-8"))
+  estacoes  <- xml_find_all(xml_root, ".//Table")
+
+  message("Total de estações pluviométricas no inventário: ", length(estacoes))
+
+  df <- map_dfr(estacoes, function(node) {
+    get_val <- function(tag) {
+      v <- xml_text(xml_find_first(node, paste0(".//", tag)))
+      if (is.na(v) || v == "") NA_character_ else trimws(v)
+    }
+    data.frame(
+      codigo    = get_val("Codigo"),
+      nome      = get_val("Nome"),
+      lat       = suppressWarnings(as.numeric(get_val("Latitude"))),
+      lon       = suppressWarnings(as.numeric(get_val("Longitude"))),
+      municipio = get_val("nmMunicipio"),
+      estado    = get_val("sgUF"),
+      resp      = get_val("ResponsavelSigla"),
+      stringsAsFactors = FALSE
+    )
+  }) %>%
+    filter(!is.na(lat), !is.na(lon))
+
+  # Converte para sf (WGS84) e depois UTM 31983 para compatibilidade espacial
+  sf_est <- st_as_sf(df, coords = c("lon", "lat"), crs = 4326) %>%
+    st_transform(31983)
+
+  return(sf_est)
+}
+
+# ==============================================================================
+# SEÇÃO 4 — FILTRO ESPACIAL COM EXPANSÃO AUTOMÁTICA DE BUFFER
+# ==============================================================================
+
+message("\nBaixando inventário de estações da ANA...")
+inventario <- obter_inventario_ana()
+
+#' Filtra estações dentro de um buffer e expande se necessário.
+#' @param bacia_utm  sf da bacia reprojetada
+#' @param inventario sf do inventário ANA
+#' @param dist_ini   Buffer inicial (m)
+#' @param dist_max   Buffer máximo (m)
+#' @param step       Incremento de expansão (m)
+#' @return lista com: estacoes_sf, buffer_final_sf, dist_final
+selecionar_estacoes <- function(bacia_utm, inventario,
+                                dist_ini, dist_max, step) {
+  dist_atual <- dist_ini
+
+  repeat {
+    buffer_atual <- st_buffer(bacia_utm, dist_atual)
+    dentro       <- st_filter(inventario, buffer_atual)
+
+    if (nrow(dentro) > 0) {
+      message(sprintf(
+        ">> %d estação(ões) encontrada(s) com buffer de %.0f m.",
+        nrow(dentro), dist_atual
+      ))
+      return(list(
+        estacoes   = dentro,
+        buffer     = buffer_atual,
+        dist_final = dist_atual
+      ))
+    }
+
+    if (dist_atual >= dist_max) {
+      stop(sprintf(
+        "Nenhuma estação encontrada mesmo com buffer de %.0f m. Verifique o shapefile ou aumente dist_buffer_max.",
+        dist_max
+      ))
+    }
+
+    dist_atual <- dist_atual + step
+    message(sprintf(
+      "Nenhuma estação no buffer de %.0f m — expandindo para %.0f m...",
+      dist_atual - step, dist_atual
+    ))
+  }
+}
+
+resultado_filtro <- selecionar_estacoes(
+  bacia_utm, inventario,
+  dist_buffer_inicial, dist_buffer_max, step_expansao
+)
+
+estacoes_sf  <- resultado_filtro$estacoes
+buffer_sf    <- resultado_filtro$buffer
+dist_final_m <- resultado_filtro$dist_final
+
+cat("\n--- ESTAÇÕES SELECIONADAS ---\n")
+print(st_drop_geometry(estacoes_sf) %>% select(codigo, nome, municipio, estado, resp))
+
+# ==============================================================================
+# SEÇÃO 5 — PESOS DE THIESSEN (VORONOI)
+# ==============================================================================
+
+#' Calcula os pesos de Thiessen (área de Voronoi ∩ buffer / área total do buffer).
+#' @param estacoes_sf  sf das estações selecionadas
+#' @param buffer_sf    sf do buffer da bacia
+#' @return data frame com: codigo, peso_thiessen
+calcular_thiessen <- function(estacoes_sf, buffer_sf) {
+
+  # Envelop expandido para evitar polígonos de Voronoi cortados na borda
+  envelope <- st_buffer(buffer_sf, dist = as.numeric(st_area(buffer_sf))^0.5)
+
+  # Voronoi sobre os pontos das estações
+  coords_union <- st_union(estacoes_sf)
+  voronoi      <- st_voronoi(coords_union, envelope = st_geometry(envelope))
+  voronoi_pol  <- st_collection_extract(voronoi, "POLYGON") %>%
+    st_sf() %>%
+    st_set_crs(st_crs(estacoes_sf))
+
+  # Intersecta com o buffer da bacia
+  voronoi_clip <- st_intersection(voronoi_pol, buffer_sf)
+
+  # Associa cada polígono de Voronoi à estação mais próxima
+  idx_nearest  <- st_nearest_feature(voronoi_clip, estacoes_sf)
+  voronoi_clip$codigo <- estacoes_sf$codigo[idx_nearest]
+
+  area_total <- as.numeric(st_area(buffer_sf))
+
+  pesos <- voronoi_clip %>%
+    mutate(area_voronoi = as.numeric(st_area(.))) %>%
+    st_drop_geometry() %>%
+    group_by(codigo) %>%
+    summarise(area_voronoi = sum(area_voronoi), .groups = "drop") %>%
+    mutate(peso_thiessen = area_voronoi / area_total)
+
+  # Normaliza para garantir soma = 1 (eventuais erros numéricos)
+  pesos$peso_thiessen <- pesos$peso_thiessen / sum(pesos$peso_thiessen)
+
+  return(pesos)
+}
+
+message("\nCalculando polígonos de Thiessen...")
+pesos_thiessen <- calcular_thiessen(estacoes_sf, buffer_sf)
+
+cat("\n--- PESOS DE THIESSEN ---\n")
+print(pesos_thiessen %>%
+        left_join(st_drop_geometry(estacoes_sf), by = "codigo") %>%
+        select(codigo, nome, area_voronoi, peso_thiessen) %>%
+        mutate(
+          area_voronoi  = round(area_voronoi / 1e6, 4),
+          peso_thiessen = round(peso_thiessen, 4)
+        ))
+
+# ==============================================================================
+# SEÇÃO 6 — EXTRAÇÃO DE SÉRIES HISTÓRICAS (WEBSERVICE ANA)
+# ==============================================================================
+
+#' Obtém máximas anuais de precipitação diária para uma estação.
+#' Correção aplicada: datas compostas corretamente a partir do mês de referência.
+#' @param cod_estacao Código da estação (character)
+#' @param nivel_cons  Nível de consistência (1 ou 2)
+#' @return data frame: Ano, P_max_anual
+obter_maximas_ana <- function(cod_estacao, nivel_cons = 2) {
+
+  url_base <- "http://telemetriaws1.ana.gov.br/ServiceANA.asmx/HidroSerieHistorica"
+
+  resp <- GET(url_base, query = list(
+    codEstacao        = as.character(cod_estacao),
+    dataInicio        = "",
+    dataFim           = "",
+    tipoDados         = "2",
+    nivelConsistencia = nivel_cons
+  ), timeout(60))
+
+  if (http_error(resp)) {
+    warning(paste("Erro HTTP para estação:", cod_estacao))
+    return(NULL)
+  }
+
+  xml_root <- read_xml(content(resp, "text", encoding = "UTF-8"))
+  series   <- xml_find_all(xml_root, ".//SerieHistorica")
+
+  if (length(series) == 0) {
+    warning(paste("Sem dados para estação:", cod_estacao))
+    return(NULL)
+  }
+
+  df_list <- map(series, function(node) {
+    data_ref_str <- xml_text(xml_find_first(node, ".//DataHora"))
+    data_ref     <- as.Date(substr(data_ref_str, 1, 10))
+
+    map_dfr(1:31, function(i) {
+      tag <- paste0(".//Chuva", sprintf("%02d", i))
+      val <- suppressWarnings(
+        as.numeric(xml_text(xml_find_first(node, tag)))
+      )
+
+      # Compõe data real; rejeita dias inexistentes no mês (ex: 31/fev)
+      data_dia <- tryCatch({
+        d <- as.Date(paste0(format(data_ref, "%Y-%m-"), sprintf("%02d", i)))
+        if (format(d, "%m") != format(data_ref, "%m")) NA_Date_ else d
+      }, error = function(e) NA_Date_)
+
+      if (is.na(data_dia)) return(NULL)
+      data.frame(Data = data_dia, Chuva_Diaria = val)
+    })
+  })
+
+  bind_rows(df_list) %>%
+    filter(!is.na(Chuva_Diaria), Chuva_Diaria >= 0) %>%
+    mutate(Ano = year(Data)) %>%
+    group_by(Ano) %>%
+    summarise(P_max_anual = max(Chuva_Diaria, na.rm = TRUE), .groups = "drop") %>%
+    filter(is.finite(P_max_anual)) %>%
+    mutate(codigo = as.character(cod_estacao))
+}
+
+message("\nBaixando séries históricas das estações selecionadas...")
+
+series_lista <- map(estacoes_sf$codigo, function(cod) {
+  message("  -> Estação: ", cod)
+  obter_maximas_ana(cod, nivel_cons = nivel_consistencia)
+})
+
+names(series_lista) <- estacoes_sf$codigo
+
+# Remove estações sem dados
+series_lista <- Filter(Negate(is.null), series_lista)
+codigos_com_dados <- names(series_lista)
+
+cat(sprintf("\n%d/%d estações com dados disponíveis.\n",
+            length(codigos_com_dados), nrow(estacoes_sf)))
+
+# ==============================================================================
+# SEÇÃO 7 — MÁXIMA ANUAL PONDERADA POR THIESSEN
+# ==============================================================================
+
+#' Pondera as máximas anuais de cada estação pelo peso de Thiessen.
+#' Apenas anos com dados em TODAS as estações são usados (ano completo).
+#' Anos parciais são ponderados pela soma dos pesos disponíveis (normalizada).
+#' @param series_lista Lista de data frames por estação
+#' @param pesos        data frame com codigo e peso_thiessen
+#' @return data frame: Ano, P_max_ponderada
+calcular_serie_ponderada <- function(series_lista, pesos) {
+
+  # Filtra pesos para apenas estações com dados
+  pesos_disp <- pesos %>%
+    filter(codigo %in% names(series_lista)) %>%
+    mutate(peso_thiessen = peso_thiessen / sum(peso_thiessen))  # renormaliza
+
+  # Empilha todas as séries
+  df_all <- bind_rows(series_lista) %>%
+    inner_join(pesos_disp, by = "codigo")
+
+  # Ponderação ano a ano (aceita anos parciais com renormalização)
+  df_pond <- df_all %>%
+    group_by(Ano) %>%
+    mutate(soma_pesos = sum(peso_thiessen)) %>%
+    summarise(
+      P_max_ponderada = sum(P_max_anual * peso_thiessen) / first(soma_pesos),
+      n_estacoes      = n(),
+      .groups         = "drop"
+    ) %>%
+    filter(is.finite(P_max_ponderada))
+
+  return(df_pond)
+}
+
+serie_ponderada <- calcular_serie_ponderada(series_lista, pesos_thiessen)
+
+cat("\n--- SÉRIE PONDERADA (Thiessen) ---\n")
+print(serie_ponderada)
+
+# ==============================================================================
+# SEÇÃO 8 — CHUVA DE PROJETO (GUMBEL)
+# ==============================================================================
+
+#' Ajusta Gumbel por momentos e retorna chuvas de projeto.
+calcular_gumbel <- function(serie_maximas, trs) {
+  media  <- mean(serie_maximas)
+  desvio <- sd(serie_maximas)
+  n      <- length(serie_maximas)
+
+  alpha <- (sqrt(6) * desvio) / pi
+  beta  <- media - 0.5772 * alpha
+
+  message(sprintf(
+    "Gumbel: n=%d anos | média=%.2f mm | σ=%.2f mm | α=%.4f | β=%.4f",
+    n, media, desvio, alpha, beta
+  ))
+
+  data.frame(TR = trs) %>%
+    mutate(
+      Prob_Nao_Excedencia = 1 - 1 / TR,
+      P_dia_mm = beta - alpha * log(-log(Prob_Nao_Excedencia))
+    )
+}
+
+tabela_projeto <- calcular_gumbel(serie_ponderada$P_max_ponderada, tr_alvos)
+
+cat("\n--- CHUVAS DE PROJETO ---\n")
+print(tabela_projeto)
+
+# ==============================================================================
+# SEÇÃO 9 — PARÂMETROS DO HIDROGRAMA SCS
+# ==============================================================================
+
+S       <- (25400 / CN) - 254
+tc_min  <- (57.6 * (comprimento_talvegue_m / 1000)) /
+           ((1.05 - 0.2 * p) * (100 * declividade_m_m)^0.04)
+tc_h    <- tc_min / 60
+dt_h    <- (tc_min / 5) / 60
+tlag_h  <- 0.6 * tc_h
+tp_h    <- dt_h / 2 + tlag_h
+qp_unit <- (0.208 * area_km2) / tp_h
+
+message(sprintf(
+  "Tc=%.2f min | Tp=%.4f h | qp_unit=%.5f m³/s/mm | S=%.2f mm | Ia=%.2f mm",
+  tc_min, tp_h, qp_unit, S, 0.2 * S
+))
+
+# Chuva excedente SCS-CN (correção P_24h = 1.14 × P_dia — DNOS/CETESB)
+calc_pe <- function(P_dia) {
+  P_24h <- P_dia * 1.14
+  Ia    <- 0.2 * S
+  if (P_24h > Ia) ((P_24h - Ia)^2) / (P_24h + 0.8 * S) else 0
+}
+
+# Hidrograma adimensional SCS (NEH, 1972 — 28 pontos)
+scs_adim <- data.frame(
+  t_Tp = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8,
+            2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.5, 4.0, 4.5, 5.0),
+  q_qp  = c(0, 0.015, 0.075, 0.16, 0.28, 0.43, 0.60, 0.77, 0.89,
+             0.97, 1.00, 0.98, 0.92, 0.84, 0.75, 0.66, 0.56, 0.42,
+             0.32, 0.24, 0.18, 0.13, 0.098, 0.075, 0.036, 0.018, 0.009, 0.004)
+)
+
+gerar_hidrograma <- function(P_dia, tr) {
+  pe <- calc_pe(P_dia)
+  qp <- qp_unit * pe
+  scs_adim %>%
+    mutate(
+      t_h    = t_Tp * tp_h,
+      Q_m3s  = q_qp * qp,
+      TR     = paste0("TR ", tr, " anos"),
+      Pe_mm  = round(pe, 3),
+      Qp_m3s = round(qp, 5)
+    )
+}
+
+hidrogramas <- pmap_dfr(
+  list(tabela_projeto$P_dia_mm, tabela_projeto$TR),
+  ~ gerar_hidrograma(..1, ..2)
+)
+
+# ==============================================================================
+# SEÇÃO 10 — TABELA DE RESUMO FINAL
+# ==============================================================================
+
+tabela_final <- tabela_projeto %>%
+  mutate(
+    Pe_mm  = map_dbl(P_dia_mm, calc_pe),
+    Qp_m3s = Pe_mm * qp_unit,
+    P_24h  = P_dia_mm * 1.14
+  ) %>%
+  select(TR, P_dia_mm, P_24h, Pe_mm, Qp_m3s)
+
+cat("\n========== TABELA FINAL DE PROJETO ==========\n")
+tabela_final %>%
+  rename(
+    `TR (anos)`  = TR,
+    `P_dia (mm)` = P_dia_mm,
+    `P_24h (mm)` = P_24h,
+    `Pe (mm)`    = Pe_mm,
+    `Qp (m³/s)` = Qp_m3s
+  ) %>%
+  print()
+
+cat("\n========== PARÂMETROS HU SCS ==========\n")
+cat(sprintf("  Tc             : %.2f min\n", tc_min))
+cat(sprintf("  Tp             : %.4f h\n",  tp_h))
+cat(sprintf("  qp unitário    : %.5f m³/s/mm\n", qp_unit))
+cat(sprintf("  CN / S / Ia    : %d / %.2f mm / %.2f mm\n", CN, S, 0.2 * S))
+cat(sprintf("  Estações usadas: %s\n", paste(codigos_com_dados, collapse = ", ")))
+cat(sprintf("  Buffer final   : %.0f m\n", dist_final_m))
+
+# ==============================================================================
+# SEÇÃO 11 — PLOTAGEM
+# ==============================================================================
+
+cores_tr <- c("TR 25 anos" = "#2196F3", "TR 50 anos" = "#FF9800", "TR 100 anos" = "#F44336")
+
+tema_base <- theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.caption     = element_text(size = 8, color = "gray50"),
+    plot.subtitle    = element_text(size = 9, color = "gray45"),
+    legend.position  = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray92"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- 11.1 Hidrogramas sobrepostos -------------------------------------------
+picos <- hidrogramas %>% group_by(TR) %>% filter(Q_m3s == max(Q_m3s)) %>% slice(1)
+
+p_hid <- ggplot(hidrogramas, aes(x = t_h, y = Q_m3s, color = TR, fill = TR)) +
+  geom_area(alpha = 0.09, position = "identity") +
+  geom_line(linewidth = 1.1) +
+  geom_vline(xintercept = tp_h, linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  annotate("text", x = tp_h + 0.015, y = max(hidrogramas$Q_m3s) * 0.96,
+           label = paste0("Tp = ", round(tp_h * 60, 1), " min"),
+           hjust = 0, size = 3, color = "gray35") +
+  geom_point(data = picos, size = 3, shape = 21, fill = "white", stroke = 1.5) +
+  geom_label(data = picos,
+             aes(label = paste0("Qp=", round(Q_m3s, 4), " m³/s")),
+             nudge_y = max(hidrogramas$Q_m3s) * 0.07,
+             size = 2.7, label.size = 0.2, show.legend = FALSE) +
+  scale_color_manual(values = cores_tr) +
+  scale_fill_manual(values = cores_tr) +
+  scale_x_continuous(labels = function(x) paste0(round(x, 1), " h")) +
+  scale_y_continuous(labels = label_number(accuracy = 0.0001, suffix = " m³/s")) +
+  labs(
+    title    = "Hidrogramas de projeto — Método SCS",
+    subtitle = paste0("Área = ", area_km2, " km²  |  CN = ", CN,
+                      "  |  Tc = ", round(tc_min, 1), " min",
+                      "  |  Ponderação: Thiessen (",
+                      length(codigos_com_dados), " estações)"),
+    x = "Tempo (h)", y = "Vazão (m³/s)", color = NULL, fill = NULL
+  ) +
+  tema_base
+
+# --- 11.2 Curva de Gumbel ---------------------------------------------------
+alpha_g <- (sqrt(6) * sd(serie_ponderada$P_max_ponderada)) / pi
+beta_g  <- mean(serie_ponderada$P_max_ponderada) - 0.5772 * alpha_g
+
+tr_seq      <- exp(seq(log(1.5), log(200), length.out = 200))
+curva_gumbel <- data.frame(TR = tr_seq) %>%
+  mutate(P_dia_mm = beta_g - alpha_g * log(-log(1 - 1 / TR)))
+
+pontos_emp <- serie_ponderada %>%
+  arrange(P_max_ponderada) %>%
+  mutate(rank = row_number(), n = n(),
+         TR_emp = 1 / (1 - rank / (n + 1)))
+
+p_gumbel <- ggplot() +
+  geom_line(data = curva_gumbel, aes(x = TR, y = P_dia_mm),
+            color = "#455A64", linewidth = 1) +
+  geom_point(data = pontos_emp, aes(x = TR_emp, y = P_max_ponderada),
+             color = "#90A4AE", size = 2.2, alpha = 0.85) +
+  geom_point(data = tabela_projeto, aes(x = TR, y = P_dia_mm),
+             color = unname(cores_tr), size = 4.5, shape = 18) +
+  geom_label(data = tabela_projeto,
+             aes(x = TR, y = P_dia_mm,
+                 label = paste0("TR", TR, "\n", round(P_dia_mm, 1), " mm")),
+             size = 2.7, label.size = 0.2, nudge_y = 8) +
+  scale_x_log10(breaks = c(2, 5, 10, 25, 50, 100, 200)) +
+  labs(
+    title   = "Ajuste de Gumbel — série ponderada (Thiessen)",
+    x       = "TR (anos) — escala log",
+    y       = "P máx. ponderada (mm)",
+    caption = paste0("Estações: ", paste(codigos_com_dados, collapse = ", "),
+                     "  |  n = ", nrow(serie_ponderada), " anos")
+  ) +
+  tema_base + theme(legend.position = "none")
+
+# --- 11.3 Polígonos de Thiessen sobre o buffer ------------------------------
+# Reconstrói Voronoi para plotagem
+
+envelope_plot  <- st_buffer(buffer_sf, dist = as.numeric(st_area(buffer_sf))^0.5)
+voronoi_plot   <- st_voronoi(st_union(estacoes_sf), envelope = st_geometry(envelope_plot))
+voronoi_pol_pl <- st_collection_extract(voronoi_plot, "POLYGON") %>%
+  st_sf() %>% st_set_crs(st_crs(estacoes_sf))
+voronoi_clip_pl <- st_intersection(voronoi_pol_pl, buffer_sf)
+
+idx_near <- st_nearest_feature(voronoi_clip_pl, estacoes_sf)
+voronoi_clip_pl$codigo <- estacoes_sf$codigo[idx_near]
+voronoi_clip_pl <- voronoi_clip_pl %>%
+  left_join(pesos_thiessen, by = "codigo")
+
+coords_est <- estacoes_sf %>%
+  mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry() %>%
+  left_join(pesos_thiessen, by = "codigo")
+
+p_mapa <- ggplot() +
+  geom_sf(data = voronoi_clip_pl, aes(fill = peso_thiessen),
+          color = "white", linewidth = 0.6, alpha = 0.75) +
+  geom_sf(data = bacia_utm, fill = NA, color = "#1565C0", linewidth = 1.2) +
+  geom_point(data = coords_est, aes(x = x, y = y),
+             shape = 24, fill = "#F44336", color = "white",
+             size = 3, stroke = 0.8) +
+  geom_label(data = coords_est,
+             aes(x = x, y = y,
+                 label = paste0(codigo, "\n", round(peso_thiessen * 100, 1), "%")),
+             size = 2.5, label.size = 0.2,
+             nudge_y = dist_final_m * 0.06, fontface = "bold") +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       labels = percent_format(accuracy = 1),
+                       name = "Peso\nThiessen") +
+  labs(
+    title    = "Polígonos de Thiessen — pesos por estação",
+    subtitle = paste0("Buffer de busca: ", dist_final_m / 1000, " km"),
+    caption  = "Azul: bacia hidrográfica | Triângulo vermelho: estação pluviométrica"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 9, color = "gray45"),
+    plot.caption  = element_text(size = 8, color = "gray50"),
+    axis.title    = element_blank(),
+    axis.text     = element_text(size = 8),
+    legend.position = "right",
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- 11.4 Barras Pe vs Abstração --------------------------------------------
+p_pe <- tabela_final %>%
+  mutate(
+    Abstr      = P_24h - Pe_mm,
+    TR_label   = paste0("TR ", TR, " anos")
+  ) %>%
+  pivot_longer(cols = c(Pe_mm, Abstr),
+               names_to = "componente", values_to = "mm") %>%
+  mutate(componente = recode(componente,
+                             Pe_mm = "Chuva excedente (Pe)",
+                             Abstr = "Abstração + Infiltração")) %>%
+  ggplot(aes(x = TR_label, y = mm, fill = componente)) +
+  geom_col(width = 0.55) +
+  geom_text(
+    data = tabela_final %>%
+      mutate(TR_label = paste0("TR ", TR, " anos")),
+    aes(x = TR_label, y = P_24h, label = paste0("Pe=", round(Pe_mm, 1), " mm")),
+    inherit.aes = FALSE, vjust = -0.4, size = 3, fontface = "bold"
+  ) +
+  scale_fill_manual(values = c(
+    "Chuva excedente (Pe)"    = "#EF5350",
+    "Abstração + Infiltração" = "#90A4AE"
+  )) +
+  labs(
+    title   = "Decomposição P₂₄ₕ por TR",
+    x       = NULL, y = "Lâmina (mm)", fill = NULL,
+    caption = paste0("CN=", CN, " | S=", round(S,1), " mm | Ia=", round(0.2*S,1), " mm")
+  ) +
+  tema_base + theme(panel.grid.major.x = element_blank())
+
+# --- 11.5 Composição final --------------------------------------------------
+painel_final <- (p_hid) /
+  (p_mapa | p_gumbel | p_pe) +
+  plot_annotation(
+    title    = "ANÁLISE HIDROLÓGICA — BACIA DO VALÃO DO CHINA",
+    subtitle = paste0(
+      "Seropédica, RJ  |  Estações selecionadas automaticamente via HidroInventário (ANA)",
+      "  |  Ponderação: Thiessen  |  Gumbel (Momentos)  |  HU SCS"
+    ),
+    caption  = paste0(
+      "Estações: ", paste(codigos_com_dados, collapse = ", "),
+      "  |  Buffer final: ", dist_final_m / 1000, " km",
+      "  |  Série ponderada: ", nrow(serie_ponderada), " anos"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 9, color = "gray40"),
+      plot.caption  = element_text(size = 8, color = "gray50"),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+  )
+
+ggsave(
+  filename = "hidrograma_thiessen_automatico.png",
+  plot     = painel_final,
+  width    = 16, height = 11,
+  dpi      = 300,
+  bg       = "white"
+)
+
+message("\nFigura salva: hidrograma_thiessen_automatico.png")
