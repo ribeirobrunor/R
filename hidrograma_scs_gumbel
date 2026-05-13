@@ -1,0 +1,506 @@
+# ==============================================================================
+# ANÁLISE HIDROLÓGICA COMPLETA - SCS + GUMBEL + ANA (CORRIGIDO PELO CLAUDE.IA)
+# ==============================================================================
+
+# --- BIBLIOTECAS ---------------------------------------------------------------
+install.packages("patchwork")
+
+library(sf)
+library(httr)
+library(xml2)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(patchwork)   # Para compor múltiplos gráficos
+library(scales)      # Para formatação de eixos
+
+# ==============================================================================
+# SEÇÃO 1 — CONFIGURAÇÃO DE AMBIENTE E ESPACIALIZAÇÃO
+# ==============================================================================
+
+# --- DEFINIÇÕES DO USUÁRIO ----------------------------------------------------
+path_shape        <- "C:/Users/bruno.ribeiro/Documents/SSD_PORTATIL/SECID/01.ADESAO/SEROPEDICA/DADOS_GIS/shapefile/bacia_valao_do_china_pourpoint.shp"
+dist_buffer       <- 10000        # Buffer de 10 km (metros)
+tr_alvos          <- c(25, 50, 100)
+nivel_consistencia <- 2           # 1 = bruto, 2 = consistido
+
+# --- 1.1 Carregar Shapefile e criar Buffer ------------------------------------
+bacia <- st_read(path_shape)
+
+# Reprojetar para UTM caso esteja em graus (necessário para buffer em metros)
+if (st_is_longlat(bacia)) {
+  bacia <- st_transform(bacia, 31983)   # SIRGAS 2000 / UTM zona 23S
+}
+
+bacia_buffer <- st_buffer(bacia, dist_buffer)
+
+# NOTA: Cruzar 'bacia_buffer' com o inventário de estações da ANA (HidroInventário)
+# para identificar os códigos das estações pluviométricas dentro do buffer.
+# Exemplo hipotético de estações encontradas:
+codigos_estacoes <- c("2243020", "2243138", "2243186")
+
+# ==============================================================================
+# SEÇÃO 2 — EXTRAÇÃO E TRATAMENTO DE DADOS (WEBSERVICE ANA)
+# ==============================================================================
+
+#' Obtém as máximas anuais de precipitação diária de uma estação da ANA.
+#'
+#' @param cod_estacao  Código da estação (character ou numeric)
+#' @param nivel_cons   Nível de consistência: 1 = bruto, 2 = consistido
+#' @return Data frame com colunas: Ano, P_max_anual (mm)
+obter_maximas_ana <- function(cod_estacao, nivel_cons = 2) {
+  
+  url_base <- "http://telemetriaws1.ana.gov.br/ServiceANA.asmx/HidroSerieHistorica"
+  
+  resp <- GET(url_base, query = list(
+    codEstacao        = as.character(cod_estacao),
+    dataInicio        = "",
+    dataFim           = "",
+    tipoDados         = "2",           # 2 = Pluviométrico
+    nivelConsistencia = nivel_cons
+  ))
+  
+  if (http_error(resp)) {
+    warning(paste("Erro HTTP para estação:", cod_estacao))
+    return(NULL)
+  }
+  
+  xml_root <- read_xml(content(resp, "text", encoding = "UTF-8"))
+  series   <- xml_find_all(xml_root, ".//SerieHistorica")
+  
+  if (length(series) == 0) {
+    warning(paste("Nenhuma série encontrada para estação:", cod_estacao))
+    return(NULL)
+  }
+  
+  # --- CORREÇÃO PRINCIPAL: composição correta das datas diárias ---------------
+  # O WebService retorna um registro por mês. 'DataHora' contém o mês de
+  # referência (ex: "2005-01-01T00:00:00"). Os valores Chuva01 a Chuva31
+  # correspondem aos dias 1 a 31 daquele mês.
+  
+  df_list <- map(series, function(node) {
+    
+    data_ref_str <- xml_text(xml_find_first(node, ".//DataHora"))
+    data_ref     <- as.Date(substr(data_ref_str, 1, 10))  # "YYYY-MM-DD"
+    
+    map_dfr(1:31, function(i) {
+      tag <- paste0(".//Chuva", sprintf("%02d", i))
+      val <- suppressWarnings(
+        as.numeric(xml_text(xml_find_first(node, tag)))
+      )
+      
+      # Compõe a data real do dia i dentro do mês de referência
+      data_dia <- tryCatch({
+        # Substitui o dia na data de referência
+        as.Date(paste0(
+          format(data_ref, "%Y-%m-"),
+          sprintf("%02d", i)
+        ))
+      }, error = function(e) NA_Date_)
+      
+      # Rejeita datas inválidas (ex: dia 31 em fevereiro)
+      if (is.na(data_dia) || format(data_dia, "%m") != format(data_ref, "%m")) {
+        return(NULL)
+      }
+      
+      data.frame(Data = data_dia, Chuva_Diaria = val)
+    })
+  })
+  
+  # --- Agrupamento anual e extração da máxima ----------------------------------
+  df_final <- bind_rows(df_list) %>%
+    filter(!is.na(Chuva_Diaria), Chuva_Diaria >= 0) %>%
+    mutate(Ano = year(Data)) %>%
+    group_by(Ano) %>%
+    summarise(P_max_anual = max(Chuva_Diaria, na.rm = TRUE), .groups = "drop") %>%
+    filter(is.finite(P_max_anual))
+  
+  return(df_final)
+}
+
+# --- Coleta os dados para a primeira estação da lista -------------------------
+dados_chuva <- obter_maximas_ana(codigos_estacoes[1], nivel_cons = nivel_consistencia)
+
+# ==============================================================================
+# SEÇÃO 3 — CHUVA DE PROJETO (DISTRIBUIÇÃO DE GUMBEL)
+# ==============================================================================
+
+#' Ajusta distribuição de Gumbel (método dos momentos) e calcula chuvas de projeto.
+#'
+#' @param serie_maximas Vetor numérico com máximas anuais (mm)
+#' @param trs           Vetor de tempos de retorno (anos)
+#' @return Data frame com TR, probabilidade e chuva de projeto (mm)
+calcular_gumbel <- function(serie_maximas, trs) {
+  
+  media  <- mean(serie_maximas)
+  desvio <- sd(serie_maximas)
+  n      <- length(serie_maximas)
+  
+  # Parâmetros de Gumbel — Ajuste por Momentos
+  alpha <- (sqrt(6) * desvio) / pi
+  beta  <- media - 0.5772 * alpha    # 0.5772 ≈ constante de Euler-Mascheroni
+  
+  message(sprintf(
+    "Gumbel ajustado: n=%d anos | média=%.1f mm | α=%.4f | β=%.4f",
+    n, media, alpha, beta
+  ))
+  
+  data.frame(TR = trs) %>%
+    mutate(
+      Prob_Nao_Excedencia = 1 - (1 / TR),
+      P_dia_mm = beta - alpha * log(-log(Prob_Nao_Excedencia))
+    )
+}
+
+# --- Execução -----------------------------------------------------------------
+tabela_projeto <- calcular_gumbel(dados_chuva$P_max_anual, tr_alvos)
+print(tabela_projeto)
+
+# ==============================================================================
+# SEÇÃO 4 — PARÂMETROS DA BACIA E TEMPO DE CONCENTRAÇÃO
+# ==============================================================================
+
+# --- DEFINIÇÕES DO USUÁRIO ----------------------------------------------------
+area_km2                <- 0.862       # Área da bacia (km²)
+comprimento_talvegue_m  <- 1692.21     # Comprimento do talvegue (m)
+declividade_m_m         <- 0.0004      # Declividade média (m/m)
+CN                      <- 77          # Curve Number
+p                       <- 0.475       # Fração de cobertura vegetal (0 a 1)
+
+# --- 4.1 Tempo de Concentração ------------------------------------------------
+# Tc (min) = 16 * L (km) / [(1.05 - 0.2p) * (100*S)^0.04] (George Ribeiro)
+# Tc (min) = 3.989 * ( L (km)^0.77 * S (m/s)^(-0.385)) (Kirpich)
+# ajuste a linha abaixo e documente a fonte.
+
+tc_min <- 3.989*(((comprimento_talvegue_m/1000)^0.77)*declividade_m_m^(-0.385))
+
+tc_h   <- tc_min / 60   # Tc em horas
+
+message(sprintf("Tc = %.2f min = %.4f h", tc_min, tc_h))
+
+# --- 4.2 Parâmetros do Hidrograma Unitário SCS --------------------------------
+# Duração da chuva unitária recomendada: delta_t ≤ 0.2 * Tc (SCS, 1972)
+delta_t_h <- (tc_min / 5) / 60        # duração unitária em horas
+
+# Tempo de retardo: tl = 0.6 * Tc  (SCS)
+t_lag_h   <- 0.6 * tc_h
+
+# Tempo de pico: Tp = delta_t/2 + tl
+t_pico_h  <- (delta_t_h / 2) + t_lag_h
+
+# Vazão de pico unitária (m³/s por mm de chuva excedente)
+q_pico_unit <- (0.208 * area_km2) / t_pico_h
+
+message(sprintf(
+  "delta_t=%.4f h | t_lag=%.4f h | Tp=%.4f h | qp_unit=%.4f m³/s/mm",
+  delta_t_h, t_lag_h, t_pico_h, q_pico_unit
+))
+
+# ==============================================================================
+# SEÇÃO 5 — CHUVA EXCEDENTE (MÉTODO CN)
+# ==============================================================================
+
+# Potencial máximo de retenção (mm)
+S <- (25400 / CN) - 254
+
+#' Calcula a chuva excedente (Pe) pelo método SCS-CN.
+#'
+#' @param P_total  Chuva de projeto diária (mm)
+#' @return         Pe em mm (chuva excedente)
+calc_pe <- function(P_total) {
+  # Correção DNOS/CETESB: P_24h ≈ 1,14 * P_dia
+  # Relação entre chuva de 24 horas e chuva diária (leituras às 7h)
+  P_24h <- P_total * 1.14
+  
+  Ia <- 0.2 * S   # Abstração inicial
+  
+  if (P_24h > Ia) {
+    Pe <- ((P_24h - Ia)^2) / (P_24h + 0.8 * S)
+  } else {
+    Pe <- 0
+  }
+  return(Pe)
+}
+
+# ==============================================================================
+# SEÇÃO 6 — CONSTRUÇÃO DOS HIDROGRAMAS (SCS ADIMENSIONAL)
+# ==============================================================================
+
+# Hidrograma adimensional do SCS (Tabela 16.2 — SCS NEH, 1972)
+scs_adim <- data.frame(
+  t_Tp  = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8,
+            2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.5, 4.0, 4.5, 5.0),
+  q_qp  = c(0, 0.015, 0.075, 0.16, 0.28, 0.43, 0.60, 0.77, 0.89,
+            0.97, 1.00, 0.98, 0.92, 0.84, 0.75, 0.66, 0.56, 0.42,
+            0.32, 0.24, 0.18, 0.13, 0.098, 0.075, 0.036, 0.018, 0.009, 0.004)
+)
+
+#' Gera o hidrograma de projeto para um dado TR.
+#'
+#' @param P_dia      Chuva de projeto diária (mm) para o TR
+#' @param tr         Tempo de retorno (anos) — usado só para rotular
+#' @param q_unit     Vazão de pico unitária (m³/s/mm)
+#' @param Tp         Tempo de pico (h)
+#' @param adim       Data frame do hidrograma adimensional SCS
+#' @return Data frame com t_h, Q_m3s, TR
+gerar_hidrograma <- function(P_dia, tr, q_unit, Tp, adim) {
+  Pe <- calc_pe(P_dia)
+  
+  Qp <- q_unit * Pe   # Vazão de pico real (m³/s)
+  
+  adim %>%
+    mutate(
+      t_h   = t_Tp * Tp,
+      Q_m3s = q_qp * Qp,
+      TR    = paste0("TR ", tr, " anos"),
+      Pe_mm = round(Pe, 2),
+      Qp_m3s = round(Qp, 4)
+    )
+}
+
+# --- Gera os hidrogramas para todos os TRs ------------------------------------
+hidrogramas <- pmap_dfr(
+  list(tabela_projeto$P_dia_mm, tabela_projeto$TR),
+  ~ gerar_hidrograma(..1, ..2, q_pico_unit, t_pico_h, scs_adim)
+)
+
+# Resumo por TR
+resumo_tr <- hidrogramas %>%
+  group_by(TR) %>%
+  summarise(
+    Pe_mm  = first(Pe_mm),
+    Qp_m3s = first(Qp_m3s),
+    .groups = "drop"
+  )
+
+cat("\n--- RESUMO DOS HIDROGRAMAS DE PROJETO ---\n")
+print(resumo_tr)
+
+# ==============================================================================
+# SEÇÃO 7 — PLOTAGEM DOS HIDROGRAMAS
+# ==============================================================================
+
+# Paleta de cores para os TRs
+cores_tr <- c(
+  "TR 25 anos"  = "#2196F3",
+  "TR 50 anos"  = "#FF9800",
+  "TR 100 anos" = "#F44336"
+)
+
+# --- 7.1 Hidrogramas sobrepostos (principal) ----------------------------------
+p1 <- ggplot(hidrogramas, aes(x = t_h, y = Q_m3s, color = TR, fill = TR)) +
+  geom_area(alpha = 0.08, position = "identity") +
+  geom_line(linewidth = 1.1) +
+  
+  # Marca o tempo de pico
+  geom_vline(xintercept = t_pico_h, linetype = "dashed",
+             color = "gray40", linewidth = 0.6) +
+  annotate("text", x = t_pico_h + 0.02, y = max(hidrogramas$Q_m3s) * 0.95,
+           label = paste0("Tp = ", round(t_pico_h, 2), " h"),
+           hjust = 0, size = 3, color = "gray30") +
+  
+  # Anotações de pico por TR
+  geom_point(
+    data = hidrogramas %>% group_by(TR) %>% filter(Q_m3s == max(Q_m3s)),
+    aes(x = t_h, y = Q_m3s), size = 3, shape = 21, fill = "white", stroke = 1.5
+  ) +
+  geom_label(
+    data = hidrogramas %>% group_by(TR) %>% filter(Q_m3s == max(Q_m3s)),
+    aes(label = paste0("Qp = ", round(Q_m3s, 3), " m³/s")),
+    nudge_y = max(hidrogramas$Q_m3s) * 0.06,
+    size = 2.8, label.size = 0.25, show.legend = FALSE
+  ) +
+  
+  scale_color_manual(values = cores_tr) +
+  scale_fill_manual(values = cores_tr) +
+  scale_x_continuous(breaks = seq(0, ceiling(max(hidrogramas$t_h)), by = 1),
+                     labels = function(x) paste0(x, " h")) +
+  scale_y_continuous(labels = label_number(accuracy = 0.001, suffix = " m³/s")) +
+  
+  labs(
+    title    = "Hidrogramas de Projeto — Método SCS",
+    subtitle = paste0(
+      "Bacia: Valão do China  |  Área: ", area_km2, " km²  |  CN: ", CN,
+      "  |  Tc: ", round(tc_min, 1), " min"
+    ),
+    x     = "Tempo (h)",
+    y     = "Vazão (m³/s)",
+    color = NULL, fill = NULL,
+    caption = "Distribuição de Gumbel (Momentos) | Chuva excedente: SCS-CN | HU: SCS Adimensional"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "gray40"),
+    plot.caption    = element_text(size = 8, color = "gray50"),
+    legend.position = "top",
+    legend.key.width = unit(1.5, "cm"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray92"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- 7.2 Painel de máximas anuais + ajuste de Gumbel -------------------------
+# Posições de plotagem de Gumbel (Weibull)
+dados_prob <- dados_chuva %>%
+  arrange(P_max_anual) %>%
+  mutate(
+    rank = row_number(),
+    n    = n(),
+    Prob_emp = rank / (n + 1),
+    TR_emp   = 1 / (1 - Prob_emp),
+    Prob_nao_exc = 1 - (1 / TR_emp)
+  )
+
+# Curva teórica de Gumbel
+gumbel_params <- calcular_gumbel(dados_chuva$P_max_anual, tr_alvos)
+alpha_g <- (sqrt(6) * sd(dados_chuva$P_max_anual)) / pi
+beta_g  <- mean(dados_chuva$P_max_anual) - 0.5772 * alpha_g
+
+tr_seq <- exp(seq(log(1.5), log(200), length.out = 100))
+curva_gumbel <- data.frame(TR = tr_seq) %>%
+  mutate(
+    Prob_nao_exc = 1 - 1/TR,
+    P_dia_mm     = beta_g - alpha_g * log(-log(Prob_nao_exc))
+  )
+
+p2 <- ggplot() +
+  geom_line(data = curva_gumbel, aes(x = TR, y = P_dia_mm),
+            color = "#455A64", linewidth = 1) +
+  geom_point(data = dados_prob, aes(x = TR_emp, y = P_max_anual),
+             color = "#78909C", size = 2, alpha = 0.8) +
+  geom_point(data = tabela_projeto, aes(x = TR, y = P_dia_mm),
+             color = unname(cores_tr), size = 4, shape = 18) +
+  geom_label(data = tabela_projeto,
+             aes(x = TR, y = P_dia_mm,
+                 label = paste0("TR", TR, "\n", round(P_dia_mm, 1), " mm")),
+             nudge_x = 0.08, nudge_y = 5,
+             size = 2.8, label.size = 0.25) +
+  scale_x_log10(breaks = c(2, 5, 10, 25, 50, 100, 200),
+                labels = c(2, 5, 10, 25, 50, 100, 200)) +
+  labs(
+    title = "Ajuste de Gumbel — Máximas Anuais",
+    x     = "Tempo de Retorno (anos) — escala log",
+    y     = "P máxima diária (mm)",
+    caption = paste0("Estação ANA: ", codigos_estacoes[1],
+                     "  |  n = ", nrow(dados_chuva), " anos")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.caption    = element_text(size = 8, color = "gray50"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray92"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- 7.3 Painel de chuva excedente por TR ------------------------------------
+p3 <- tabela_projeto %>%
+  mutate(
+    Pe_mm = map_dbl(P_dia_mm, calc_pe),
+    Ia    = 0.2 * S,
+    P_24h = P_dia_mm * 1.14,
+    Abstr = P_24h - Pe_mm,
+    TR_label = paste0("TR ", TR, " anos")
+  ) %>%
+  pivot_longer(cols = c(Pe_mm, Abstr), names_to = "componente", values_to = "mm") %>%
+  mutate(
+    componente = recode(componente,
+                        Pe_mm = "Chuva excedente (Pe)",
+                        Abstr = "Abstração + Infiltração")
+  ) %>%
+  ggplot(aes(x = TR_label, y = mm, fill = componente)) +
+  geom_col(width = 0.55) +
+  geom_text(
+    data = tabela_projeto %>%
+      mutate(Pe = map_dbl(P_dia_mm, calc_pe),
+             TR_label = paste0("TR ", TR, " anos")),
+    aes(x = TR_label, y = P_dia_mm * 1.14, label = paste0("Pe = ", round(Pe, 1), " mm")),
+    inherit.aes = FALSE, vjust = -0.4, size = 3, fontface = "bold"
+  ) +
+  scale_fill_manual(values = c(
+    "Chuva excedente (Pe)"     = "#EF5350",
+    "Abstração + Infiltração"  = "#90A4AE"
+  )) +
+  labs(
+    title   = "Decomposição da Chuva de Projeto (P₂₄ₕ)",
+    x       = NULL,
+    y       = "Lâmina (mm)",
+    fill    = NULL,
+    caption = paste0("CN = ", CN, "  |  S = ", round(S, 1), " mm  |  Ia = ", round(0.2*S, 1), " mm")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.caption    = element_text(size = 8, color = "gray50"),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major = element_line(color = "gray92"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+# --- 7.4 Composição final com patchwork ---------------------------------------
+layout <- "
+AAAA
+BBCC
+"
+
+painel_final <- p1 / (p2 | p3) +
+  plot_annotation(
+    title   = "ANÁLISE HIDROLÓGICA — BACIA DO VALÃO DO CHINA",
+    subtitle = paste0(
+      "Seropédica, RJ  |  Estação ANA: ", codigos_estacoes[1],
+      "  |  CN = ", CN,
+      "  |  Área = ", area_km2, " km²"
+    ),
+    caption  = "Metodologia: ANA HidroWeb | Gumbel (Momentos) | SCS-CN | HU SCS Adimensional",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 10, color = "gray40"),
+      plot.caption  = element_text(size = 8, color = "gray50"),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+  )
+
+# --- 7.5 Exportação -----------------------------------------------------------
+ggsave(
+  filename = "hidrograma_projeto.png",
+  plot     = painel_final,
+  width    = 14,
+  height   = 10,
+  dpi      = 300,
+  bg       = "white"
+)
+
+message("Figura salva: hidrograma_projeto.png")
+
+# ==============================================================================
+# SEÇÃO 8 — TABELAS DE SAÍDA RESUMIDAS
+# ==============================================================================
+
+cat("\n========== CHUVAS DE PROJETO (GUMBEL) ==========\n")
+tabela_projeto %>%
+  mutate(Pe_mm = map_dbl(P_dia_mm, calc_pe),
+         Qp_m3s = Pe_mm * q_pico_unit) %>%
+  select(TR, P_dia_mm, Pe_mm, Qp_m3s) %>%
+  rename(
+    `TR (anos)`   = TR,
+    `P_dia (mm)`  = P_dia_mm,
+    `Pe (mm)`     = Pe_mm,
+    `Qp (m³/s)`   = Qp_m3s
+  ) %>%
+  print()
+
+cat("\n========== PARÂMETROS DO HU SCS ==========\n")
+cat(sprintf("  Tc             : %.2f min (%.4f h)\n", tc_min, tc_h))
+cat(sprintf("  delta_t        : %.4f h\n", delta_t_h))
+cat(sprintf("  t_lag          : %.4f h\n", t_lag_h))
+cat(sprintf("  Tp             : %.4f h\n", t_pico_h))
+cat(sprintf("  qp unitário    : %.4f m³/s/mm\n", q_pico_unit))
+cat(sprintf("  S (SCS-CN)     : %.2f mm\n", S))
+cat(sprintf("  Ia             : %.2f mm\n", 0.2 * S))
